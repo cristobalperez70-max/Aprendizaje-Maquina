@@ -1,0 +1,396 @@
+---
+title: "Análisis Bootstrap, Bagging y Modelos Predictivos aplicados a problemas de control de inventario con degradación de productos."
+author: Cristóbal Pérez González.
+format: html
+engine: julia
+execute:
+  echo: true
+  results: show
+  output: true
+  warning: false
+  message: false
+  eval: true
+---
+
+# Introducción.
+
+En esta presentación se aprendera a aplicar **técnicas de remuestreo (Bootstrap)** y **Bagging (Bootstrap Aggregating)** en problemas de control de inventario con degradación de productos.  
+
+Antes de entrar al código, recuerde los siguientes conceptos:
+
+- **Bootstrap:** Técnica estadística que crea múltiples "nuevas muestras" a partir de los datos originales, extrayendo observaciones **con reemplazo**. Lo cual permite medir la **incertidumbre** de los estimadores. 
+
+La idea básica es:
+
+1.- Tomar la muestra original.
+
+2.- Generar muchas remuestras con reemplazo (es decir, podemos repetir los 
+mismos datos).
+
+3.- Calcular el estadístico de interés en cada remuestra.
+
+4.- Analizar la distribución de estos estadísticos para ver su variabilidad y construir intervalos de confianza. 
+
+- **Intervalo de confianza Bootstrap:** Rango de valores donde es muy probable que se encuentre el verdadero parámetro poblacional (ej. la media). 
+
+- **Bagging:** Técnica de aprendizaje máquina donde se entrenan muchos modelos en diferentes remuestras bootstrap y luego **se promedian** sus predicciones en el caso de regresion y se **vota** en el caso de calsificacion, con esto se reducela varianza y mejora la estabilidad de los modelos.  
+
+---
+
+## Importación de librerías
+
+Primero se carga todas las librerías necesarias para generar datos, manipularlos, entrenar modelos y graficar resultados.
+
+```{julia}
+using Pkg
+
+# Lista de paquetes a instalar
+packages = [
+    "Distributions",
+    "DataFrames",
+    "GLM",
+    "DecisionTree",
+    "Plots",
+    "Statistics",
+    "StatsPlots",
+    "Random",
+    "PrettyTables"
+]
+
+# Instalar todos los paquetes
+for package in packages
+    println("Instalando $package...")
+    Pkg.add(package)
+end
+using Distributions   # Para generar datos sintéticos
+using DataFrames      # Para manejar datos tabulares
+using PrettyTables    # Para tener una mejor visualiación del Dataframe
+using GLM             # Para modelos de regresión lineal y logística
+using DecisionTree    # Para árboles de decisión y Bagging (Random Forest)
+using Plots           # Para visualización
+using Statistics      # Para funciones estadísticas básicas
+using StatsPlots      # Para gráficos estadísticos avanzados
+using Random          # Para el control de semillas para reproducibilidad
+
+# Se fija una semilla para que los resultados sean reproducibles
+Random.seed!(123)
+```
+
+# PARTE A: FUNDAMENTOS DE BOOSTRAP.
+
+## 1.- Re-muestreo con reemplazo.
+
+El **Bootstrap** parte de la idea de que, aunque solo se tenga una **muestra**, se puede generar muchas más extrayendo valores con **reemplazo**.
+
+Se considera una muestra pequeña de niveles de inventario perdidos por degradación:
+
+```{julia}
+inventario_perdido = [3, 5, 7]
+media_original = mean(inventario_perdido)
+println("Muestra original: $inventario_perdido")
+println("Media original: $media_original \n")
+```
+
+Se genera 5 re-muestreos con reemplazo (remuestras Boostrap) de tamaño 3 con reemplazo:
+
+```{julia}
+for i in 1:5
+    remuestra = rand(inventario_perdido, 3)
+    media_remuestra = round(mean(remuestra), digits=2)
+    println("Remuestra $i: $remuestra -> Media: $media_remuestra")
+end
+```
+
+De lo anterior se ve que las medias varían alrededor de la media original. Esto muestra la variabilidad que tendrían las estimaciones si el estudio se repitiera.
+
+## 2.- Intervalos de confianza Bootstrap.
+
+Ahora se vera cómo usar Bootstrap para estimar un intervalo de confianza del 95% para la media de la degradación de productos.
+Se simularan 20 observaciones de productos degradados (valores entre 1% y 10%).
+
+```{julia}
+datos_degradacion = rand(Uniform(0.01, 0.10), 20)
+media_observada = mean(datos_degradacion)
+println("Proporción media de degradación observada: $(round(media_observada, digits=4)) \n")
+```
+
+Se generan 1000 remuestreos para construir la distribución bootstrap.
+
+```{julia}
+n_remuestreos = 1000
+medias_bootstrap = zeros(n_remuestreos) 
+for i in 1:n_remuestreos
+    remuestra = rand(datos_degradacion, length(datos_degradacion))
+    medias_bootstrap[i] = mean(remuestra)
+end
+```
+
+Con lo cual se contruye un intervalo de confianza del 95%, tomando los percentiles 2.5 y 97.5 de las medias bootstrap
+
+```{julia}
+limite_inferior = quantile(medias_bootstrap, 0.025)
+limite_superior = quantile(medias_bootstrap, 0.975)
+
+println("--- Intervalo de Confianza Bootstrap (95%) ---")
+println("El intervalo de confianza para la proporción media de degradación es: [$(round(limite_inferior, digits=4)), $(round(limite_superior, digits=4))]")
+```
+
+Finalmente se visualiza de la distribución de las medias.
+
+```{julia}
+histogram(medias_bootstrap,
+          label="Distribución de Medias Bootstrap",
+          xlabel="Proporción Media de Degradación",
+          ylabel="Frecuencia",
+          title="Distribución Bootstrap",
+          legend=:outerright)
+vline!([limite_inferior, limite_superior], label="IC 95%", lw=2, color=:red, legend=:outerright)
+```
+
+De lo anterior se observa que la media original cae dentro del intervalo de confianza.
+
+En términos de riesgo de pérdida de inventario, el límite superior del Intervalo representa el peor escenario razonable. Para una gestión de inventario segura, se debería planificar considerando que la pérdida podría llegar a ser tan alta como este valor, analogamente el límite inferior representa el mejor escenario.
+
+# PARTE B: BOOSTRAP EN MACHINE LEARNING.
+
+## 3.- Bootstrap y validación de modelos.
+
+Se crea un dataset sintético para clasificación (degradado = 1, no degradado = 0) donde se usara una regresion logisitca siguiendo la siguiente regla logica: más temperatura, mas dias de almacenamiento y si el tipo de producto es perecedero, entonces hay mas probabilidad de degradación.
+
+Esto permite controlar la verdadera relación y probar métodos.
+
+```{julia}
+n_obs = 150
+df_logistica = DataFrame(
+    temperatura = rand(Uniform(10, 20), n_obs),
+    dias_almacenamiento = rand(1:20, n_obs),
+    tipo_producto = rand(["perecedero", "no_perecedero"], n_obs)
+)
+
+prob_degradacion = 1 ./ (1 .+ exp.(-(-6 .+ 13 .* df_logistica.temperatura .+ 17 .* df_logistica.dias_almacenamiento .+ 19 .* (df_logistica.tipo_producto .== "perecedero"))))
+df_logistica.degradado = [rand(Bernoulli(p)) for p in prob_degradacion]
+
+println("--- Dataset para Regresión Logística (primeras 5 filas)---")
+pretty_table(first(df_logistica, 5))
+```
+
+Se usara Boostrap con 500 re-muestreos para poder visualizar la distribución de los coeficientes al ajustar un modelo de regresión logística.
+
+```{julia}
+n_remuestreos_modelo = 500
+coeficientes_bootstrap = zeros(n_remuestreos_modelo, 4)
+
+for i in 1:n_remuestreos_modelo
+    indices = rand(1:nrow(df_logistica), nrow(df_logistica))
+    remuestra_df = df_logistica[indices, :]
+
+    modelo_bs = glm(@formula(degradado ~ temperatura + dias_almacenamiento + tipo_producto), remuestra_df, Binomial(), LogitLink())
+    
+    coeficientes_bootstrap[i, :] = coef(modelo_bs)
+end
+
+p1 = histogram(coeficientes_bootstrap[:, 2], title="Coef. Temperatura", legend=false)
+p2 = histogram(coeficientes_bootstrap[:, 3], title="Coef. Días Almacénamiento.", legend=false)
+p3 = histogram(coeficientes_bootstrap[:, 4], title="Coef. Tipo Perecedero", legend=false)
+plot(p1, p2, p3, layout=(1, 3), size=(1000, 300))
+```
+
+De los histogramas anteriores se ve que el coeficiente asociado a los días de almacénamiento es un coeficiente estable, pues el histograma es estecho y esta alejado del cero, esto significa que la relación es fuerte y estable.
+
+Por otro lado los coeficientes asociados a la temperatura y tipo de producto (perecedero) son coeficientes inestables, pues aunque los histogramas son ligeramente estrechos, el cero queda justo en medio, esto indica que la relación es débil o incierta. Esto indica que el impacto de esas variables cambian mucho dependiendo de los datos específicos que se usen para entrenar, lo que nos dice que no se puede confiar demasiado en esas relaciónes.
+
+En resumen, el bootstrap ayuda a pasar de la temperatura tiene un coeficiente de 0.4 a es muy seguro de que el impacto de la temperatura está entre 0.3 y 0.5, cuantificando así la confianza en cada variable del modelo.
+
+En la practica se recomienda usar Boostrap, ya que nos da una forma no paramétrica (no requiere supuestos fuertes, ni normalidad en los datos) de cuantificar incertidumbre.
+
+## 4.- Bagging aplicado a inventarios.
+
+Se entrenara primero un solo árbol de decisión al mismo dataset de regresión logistica.
+
+```{julia}
+X = select(df_logistica, [:temperatura, :dias_almacenamiento])
+X.tipo_producto_num = (df_logistica.tipo_producto .== "perecedero") # Convertir a numérico
+y = df_logistica.degradado
+
+modelo_arbol_simple = DecisionTreeClassifier(max_depth=1)
+DecisionTree.fit!(modelo_arbol_simple, Matrix(X), y)
+predicciones_simple = DecisionTree.predict(modelo_arbol_simple, Matrix(X))
+accuracy_simple = mean(predicciones_simple .== y)
+println("Accuracy de un solo Árbol de Decisión: $(accuracy_simple)")
+```
+
+Ahora se entrenara un Random Forest al mismo dataset con 500 árboles de decisión en diferentes remuestras bootstrap y combinar sus predicciones, esto reduce varianza del estimador final (menos sensibilidad a datos particulares).
+
+Cabe aclarar que en el Random Forest no solo es aplicar Bagging, pues en el Random Forest aparte de aplicar Bagging tambien se hace un submuestreo en las variables, es decir que cada arbol no se entrena con todas las variables predictoras, si no que con solo agunas, en este caso cada arbol se entrenara con dos  de las tres variables predictoras (temperatura, dias de almacenamiento y tipo de producto), con esto se reduce la correlación entre árboles.
+
+```{julia}
+ensamble_bagging = RandomForestClassifier(n_trees=500, n_subfeatures=2)
+DecisionTree.fit!(ensamble_bagging, Matrix(X), y)
+predicciones_bagging = DecisionTree.predict(ensamble_bagging, Matrix(X))
+accuracy_bagging = mean(predicciones_bagging .== y)
+println("Accuracy del Ensamble Bagging, Random Forest (500 árboles): $(accuracy_bagging)")
+```
+
+De lo anterior se ve que mejora rotundamente la estabilidad del criterio de degradación al usar bagging, esta es una de las principales ventajas del bagging.
+
+Asi se ve que al hacer votos sobre las predicciones de múltiples modelos (árboles), se reduce la varianza y se mejora la precisión general del modelo.
+
+# PARTE C: PROBLEMA APLICADO: CONTROL DE INVENTARIOS CON DEGRADACIÓN POR TEMPERATURA.
+
+Ahora se combinara todo en un caso mas realista:
+
+Primero se generara para 200 lotes, la temperatura en °C en la que fue alamacenado el lote que sigue una distribucíón uniforme en el intervalo (15,25), tambien los dias de almacenamiento, que van de 5 a 60 dias, y finalmente la categoria del lote (congelado, refrigerado ó ambiente).
+
+Luego se generara el porcentaje de pérdida, de la siguiente manera: 
+
+Por cada grado de temperatura que aumenta, el porcentaje de perdidas aumenta un 0.2%, por cada dia extra que permenece en almacenamiento, el porcentaje de perdida aumenta un 0.5%, el efecto de la categoria depende del tipo de categoria (congelado, refrigerado ó ambiente), finalmente se le agrega un ruido, y se asegura que el porcentaje de perdida este entre un 0% y 100%.
+
+```{julia}
+n_lotes = 200
+df_perdidas = DataFrame(
+    temperatura = rand(Uniform(15, 25), n_lotes), # °C
+    tiempo_almacenamiento = rand(5:60, n_lotes), # días
+    categoria = rand(["congelado", "refrigerado", "ambiente"], n_lotes)
+)
+# Regla de degradación: más temp y tiempo -> más pérdida. Categoría afecta.
+efecto_categoria = map(c -> c == "congelado" ? -10 : (c == "refrigerado" ? 0 : 15), df_perdidas.categoria)
+perdida_base = 0.2 .* df_perdidas.temperatura .+ 0.5 .* df_perdidas.tiempo_almacenamiento .+ efecto_categoria
+ruido = rand(Normal(0, 5), n_lotes) # Incertidumbre aleatoria
+df_perdidas.perdida_pct = clamp.(perdida_base .+ ruido, 0, 100) # Pérdida entre 0% y 100%
+
+println("\n--- Dataset para el Problema Aplicado ---")
+pretty_table(first(df_perdidas, 5))
+```
+
+Ahora se entrenara un modelo de regresión lineal para predecir el porcentaje de pérdida.
+
+```{julia}
+modelo_regresion = lm(@formula(perdida_pct ~ temperatura + tiempo_almacenamiento + categoria), df_perdidas)
+println("\n--- Modelo de Regresión Inicial ---")
+display(modelo_regresion)
+```
+
+Se usara bootstrap para medir la incertidumbre del error del modelo (RMSE) y tambien para medir la incertidumbre del coeficiente de determinacion $R^2$.
+
+```{julia}
+n_remuestreos_final = 200
+rmses_bootstrap = zeros(n_remuestreos_final)
+r2s_bootstrap = zeros(n_remuestreos_final)
+
+for i in 1:n_remuestreos_final
+    indices = rand(1:nrow(df_perdidas), nrow(df_perdidas))
+    remuestra_df = df_perdidas[indices, :]
+     # Entrenar el modelo en el remuestreo
+    modelo_bs = lm(@formula(perdida_pct ~ temperatura + tiempo_almacenamiento + categoria), remuestra_df)
+    
+    # a) Calcular y guardar RMSE (evaluado sobre el dataset original)
+    predicciones = GLM.predict(modelo_bs, df_perdidas)
+    error_cuadratico = (predicciones .- df_perdidas.perdida_pct).^2
+    rmses_bootstrap[i] = sqrt(mean(error_cuadratico))
+    # b) Calcular y guardar R² del modelo bootstrap
+    r2s_bootstrap[i] = r2(modelo_bs)
+end
+
+# 4. Analizamos la distribución del RMSE
+ic_rmse_95 = quantile(rmses_bootstrap, [0.025, 0.975])
+ic_r2_95 = quantile(r2s_bootstrap, [0.025, 0.975])
+
+println("\n--- Análisis de Incertidumbre del Modelo (Completo) ---")
+println("Intervalo de confianza (95%) para el RMSE: [$(round(ic_rmse_95[1], digits=3)), $(round(ic_rmse_95[2], digits=3))]")
+println("Intervalo de confianza (95%) para el R²:   [$(round(ic_r2_95[1], digits=3)), $(round(ic_r2_95[2], digits=3))]")
+```
+
+Como el intervalo de confianza del 95% del RMSE es [4.668, 4.812], esto significa que, al re-muestrear muchas veces los datos, el error típico de predicción del modelo se mantiene estable, entre 4.7 y 4.8 unidades, el cual es un intervalo muy estrecho, lo cual indica que el modelo es consistente: su error no cambia demasiado de una muestra a otra.
+
+Analogamente como el intervalo de confianza del 95% del $R^2$ es [0.841, 0.896], esto significa que en el peor de los casos, el modelo explica un 84% de la variabilidad de la variable dependiente, y en el mejor de los casos, cerca del 90%.
+Es un rango alto y relativamente estrecho, lo que refuerza que el modelo tiene buen poder explicativo.
+
+Finalmente para ver mejor la distribucion del (RMSE) y del $R^2$, se graficaran los histogramas y boxplots correspondiente a cada uno.
+
+```{julia}
+df_resultados_bs = DataFrame(RMSE = rmses_bootstrap, R2 = r2s_bootstrap)
+
+# Gráfico 1: Histograma del RMSE
+p_hist_rmse = histogram(df_resultados_bs.RMSE, 
+                        title="Distribución del RMSE", 
+                        legend=false, 
+                        normalize=:probability,
+                        xlabel="")
+vline!(p_hist_rmse, ic_rmse_95, color=:red, linestyle=:dash, label="IC 95%")                        
+
+# Gráfico 2: Boxplot del RMSE
+p_box_rmse = @df df_resultados_bs boxplot(:RMSE, 
+                                          title="Boxplot del RMSE", 
+                                          legend=false, 
+                                          ylabel="RMSE")
+
+# Gráfico 3: Histograma del R²
+p_hist_r2 = histogram(df_resultados_bs.R2, 
+                      title="Distribución del R²", 
+                      legend=false, 
+                      normalize=:probability,
+                      color=:orange)
+vline!(p_hist_r2, ic_r2_95, color=:red, linestyle=:dash, label="IC 95%")                      
+
+# Gráfico 4: Boxplot del R²
+p_box_r2 = @df df_resultados_bs boxplot(:R2, 
+                                        title="Boxplot del R²", 
+                                        legend=false, 
+                                        ylabel="R²", 
+                                        color=:orange)
+
+# Se combinan los 4 gráficos en un solo layout
+plot(p_hist_rmse, p_box_rmse, p_hist_r2, p_box_r2, 
+     layout=(2, 2), 
+     size=(1000, 700),
+     left_margin=5Plots.mm)
+```
+
+Como la distribución del RMSE, es un poco simetrica y concentrada, esto significa que el error de predicción del modelo es bastante estable, como el rango del IC está entre 4.668 y 4.812, entonces el modelo se equivoca en promedio alrededor de ±5 puntos porcentuales de pérdida.
+
+Tambien como el Boxplot del RMSE es una caja muy compacta, y casi no hay outliers, confirma que no existen escenarios en los que el modelo “explote” con errores muy altos.
+
+Asi como el error de predicción del modelo es bajo y consistente, esto significa que las estimaciones del porcentaje de pérdida son confiables para tomar decisiones (ej. planear inventario extra para cubrir ~5% de error máximo esperado).
+
+Analogamente como la distribución del R^2 está centrado alrededor de 0.87, entonces el modelo explica en promedio casi el 87% de la variabilidad en las pérdidas, como la distribución es estrecha, esto indica que el modelo casi siempre rinde parecido, independientemente de la muestra.
+
+Tambien como el Boxplot  es una caja pequeña y sin muchos valores atípicos extremos (solo 2), quiere decir que el poder explicativo del modelo es robusto.
+
+Con lo cual el modelo capta la mayor parte de las causas que afectan el porcentaje de pérdida (temperatura, días de almacenamiento, tipo de producto, etc.), y rara vez baja de un desempeño alto.
+
+## 5.- Conclusión.
+
+Por ultimo se va a predecir el porcentaje de pérdida esperada considerando incertidumbre, para un producto refrigerado almacenado 10 días a 8°C.
+
+```{julia}
+#5. **Conclusión**
+# Creamos el escenario que queremos predecir
+escenario = DataFrame(temperatura=8, tiempo_almacenamiento=10, categoria="refrigerado")
+
+# Generamos 200 predicciones, una por cada modelo bootstrap
+predicciones_escenario = zeros(n_remuestreos_final)
+for i in 1:n_remuestreos_final
+    indices = rand(1:nrow(df_perdidas), nrow(df_perdidas))
+    remuestra_df = df_perdidas[indices, :]
+    modelo_bs = lm(@formula(perdida_pct ~ temperatura + tiempo_almacenamiento + categoria), remuestra_df)
+    predicciones_escenario[i] = GLM.predict(modelo_bs, escenario)[1]
+end
+
+# Obtenemos un intervalo de predicción
+intervalo_prediccion = quantile(predicciones_escenario, [0.025, 0.975])
+
+println("\n--- Conclusión Práctica ---")
+println("Para un producto refrigerado almacenado 10 días a 8°C:")
+println("El intervalo de confianza al 95% para la pérdida por degradación es del $(round(intervalo_prediccion[1], digits=1))% al $(round(intervalo_prediccion[2], digits=1))%.")
+
+println("Pregunta Final: ¿Cómo ayuda esto a diseñar políticas de inventario más seguras?")
+println("Esta información es crucial. En lugar de basar una política de reabastecimiento en una única predicción (ej. se perderá el 7%), podemos usar el intervalo. Para ser conservadores (política segura), podríamos planificar asumiendo el peor caso del intervalo (pérdida del $(intervalo_prediccion[2])%).")
+```
+
+## 6.- Bibliografía:
+
+1.- Efron, B. (1979). Bootstrap methods: Another look at the jackknife. The Annals of Statistics, 7(1), 1–26.
+
+2.- Breiman, L. (1996). Bagging predictors. Machine Learning, 24(2), 123–140.
+
+3.- Breiman, L. (2001). Random forests. Machine Learning, 45(1), 5–32.
